@@ -1,0 +1,30 @@
+# Sweep working directories — results are reproduced by running the sweep specs
+sweeps/*/results/
+sweeps/*/results_server1/
+sweeps/*/results_server2/
+sweeps/*/networks/sweep_*/
+sweeps/*/configs/sweep_*/
+sweeps/*/analysis/
+sweeps/*/analysis_arm_*/
+
+# Analysis tool outputs — reproduced by running analysis scripts
+analysis/output/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.eggs/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Logs
+*.log

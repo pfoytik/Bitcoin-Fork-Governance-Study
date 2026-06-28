@@ -1,0 +1,670 @@
+#!/usr/bin/env python3
+"""
+Outcome Sensitivity Analysis — d_pools and d_economic
+
+Computes per-scenario governance leverage scores for the two actor classes
+that actually determine 2016-block fork outcomes:
+
+  d_pools    — RF probability gradient with respect to pool_committed_split.
+                High d_pools = a small change in which large pools commit to
+                which fork would substantially change the predicted outcome.
+                Peaks at the committed_split threshold (~0.296 in the transition
+                zone, ~0.214 at the Foundry flip-point).
+
+  d_economic — RF probability gradient with respect to economic_split, gated
+                by position within the inversion zone [0.50, 0.82].
+                High d_economic = exchange/custodian custody decisions are
+                genuinely pivotal. Near-zero below the cascade floor or above
+                the economic override threshold where the outcome is structurally
+                determined regardless of economic action.
+
+Both scores are derived from the RF probability gradient rather than hard
+threshold distances — they reflect how rapidly the model's predicted outcome
+probability changes as the parameter moves, which is the correct measure of
+governance leverage.
+
+The joint sensitivity surface identifies "maximum governance leverage" scenarios
+where both actor classes are simultaneously pivotal, and "unexpected outcome"
+scenarios where high sensitivity was available but the outcome resolved cleanly
+anyway.
+
+Usage:
+    python tools/discovery/scenario_potential.py
+    python tools/discovery/scenario_potential.py --db path/to/sweep_results.db
+    python tools/discovery/scenario_potential.py --output-dir tools/discovery/output/sp
+
+Output (tools/discovery/output/sp/ by default):
+    sp_scores.csv                   — per-scenario d_pools, d_economic, Z_joint
+    sp_top_scenarios.json           — top 20 scenarios by joint Z_joint
+    fig_sp_surface.png              — d_pools × d_economic scatter on E×C surface
+    fig_sp_top_scenarios.png        — parameter profiles of top joint-Z_joint scenarios
+    sp_report.md                    — human-readable summary
+"""
+
+import argparse
+import json
+import sqlite3
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import matplotlib.patches as mpatches
+from matplotlib.lines import Line2D
+from sklearn.ensemble import RandomForestClassifier
+
+# =============================================================================
+# Configuration — mirrors fit_boundary.py and plot_decision_boundary.py
+# =============================================================================
+
+DB_PATH     = Path('tools/sweep/sweep_results.db')
+OUTPUT_DIR  = Path('tools/discovery/output/sp')
+
+ACTIVE_PARAMS = [
+    'economic_split',
+    'pool_committed_split',
+    'pool_ideology_strength',
+    'pool_max_loss_pct',
+]
+
+# Full 2016-block dataset (VALID_SWEEPS_2016 + Phase 3 full-network)
+VALID_SWEEPS_2016 = [
+    'econ_committed_2016_grid',
+    'lhs_2016_full_parameter',
+    'lhs_2016_6param',
+    'targeted_sweep7_esp_2016',
+    'targeted_sweep10_econ_threshold_2016',
+    'targeted_sweep10b_econ_threshold_2016',
+    'targeted_sweep8_lite_2016_retarget',
+    'targeted_sweep9_long_duration_2016',
+    'targeted_sweep11_lite_chaos_test',
+    'committed_2016_high_econ',
+    'committed_2016_mid_econ',
+    'committed_2016_sigmoid',
+    'committed_2016_sigmoid_midecon',
+    'hashrate_2016_verification',
+    'lhs_2016_full_phase3_merged',
+]
+
+# Structural thresholds from Phase 1–3 findings
+ECON_CASCADE_FLOOR  = 0.50   # below this v27 cannot win (economic layer inactive)
+ECON_ESP            = 0.74   # Economic Self-Sustaining Point — max d_economic
+ECON_OVERRIDE       = 0.82   # above this v27 wins regardless (economic layer inactive)
+COMMITTED_THRESHOLD = 0.296  # Phase 3 transition zone committed_split threshold
+FOUNDRY_FLIP        = 0.214  # Foundry flip-point — structural boundary
+
+# PRIM uncertainty box (from fit_boundary.py, n=295)
+PRIM_BOX = {
+    'economic_split':         (0.28, 0.78),
+    'pool_committed_split':   (0.15, 0.53),
+    'pool_ideology_strength': (0.44, 0.80),
+    'pool_max_loss_pct':      (0.16, 0.40),
+}
+
+RF_N_ESTIMATORS = 600
+RF_RANDOM_STATE = 42
+GRADIENT_DELTA  = 0.02   # step size for numerical gradient computation
+#
+# Sensitivity analysis (delta_test2.py, n=401, RF n_estimators=200):
+#   delta=0.001: 57.1% zero-gradient scenarios — too small, nudge misses tree thresholds
+#   delta=0.005: 30.9% zeros, r=0.83 vs 0.010 — slightly too small
+#   delta=0.010: 22.7% zeros, r=0.75 vs 0.020 — acceptable but underestimates near-boundary
+#   delta=0.020: 17.0% zeros, r=0.75 vs 0.010 — best balance, selected
+#   delta=0.050: 5.5%  zeros, r=0.44 vs 0.010 — too large, averages over multiple thresholds
+#
+# The RF probability surface is piecewise constant (600 tree votes), so the
+# "true" derivative is undefined between split thresholds and infinite at them.
+# The finite-difference estimate approximates the local gradient by spanning
+# enough split thresholds to get a stable aggregate signal without blurring
+# across distant boundaries. 0.02 spans ~10-20 thresholds on average given
+# n=590 scenarios over committed_split range [0.10, 0.70].
+DPI = 300
+
+
+# =============================================================================
+# Data loading
+# =============================================================================
+
+def load_data(db_path: Path) -> pd.DataFrame:
+    conn = sqlite3.connect(db_path)
+    placeholders = ','.join(['?' for _ in VALID_SWEEPS_2016])
+    query = f"""
+        SELECT
+            sr.sweep_name,
+            s.economic_split,
+            s.pool_committed_split,
+            s.pool_ideology_strength,
+            s.pool_max_loss_pct,
+            s.outcome,
+            s.total_reorgs,
+            s.reorg_mass,
+            s.cascade_time_s,
+            s.econ_lag_s,
+            s.duration,
+            s.scenario_id
+        FROM scenarios s
+        JOIN sweeps sr ON s.sweep_id = sr.sweep_id
+        WHERE sr.sweep_name IN ({placeholders})
+          AND s.outcome IN ('v27_dominant', 'v26_dominant', 'contested')
+    """
+    df = pd.read_sql_query(query, conn, params=VALID_SWEEPS_2016)
+    conn.close()
+    df = df.dropna(subset=ACTIVE_PARAMS).reset_index(drop=True)
+    print(f"Loaded {len(df)} scenarios from {df['sweep_name'].nunique()} sweeps")
+    return df
+
+
+# =============================================================================
+# RF training
+# =============================================================================
+
+def train_rf(df: pd.DataFrame) -> RandomForestClassifier:
+    X = df[ACTIVE_PARAMS].values
+    y = (df['outcome'] == 'v27_dominant').astype(int).values
+    rf = RandomForestClassifier(
+        n_estimators=RF_N_ESTIMATORS,
+        oob_score=True,
+        random_state=RF_RANDOM_STATE,
+        n_jobs=-1,
+    )
+    rf.fit(X, y)
+    print(f"RF OOB accuracy: {rf.oob_score_*100:.1f}%  "
+          f"(n={len(X)}, v27_win_rate={y.mean()*100:.1f}%)")
+    return rf
+
+
+# =============================================================================
+# Contentiousness (mirrors fit_boundary.py / user_prim.py)
+# =============================================================================
+
+def compute_contentiousness(df: pd.DataFrame) -> np.ndarray:
+    scores = np.zeros(len(df))
+
+    def normalize(arr, invert=False):
+        arr = np.array(arr, dtype=float)
+        arr = np.nan_to_num(arr, nan=0.0)
+        if arr.max() == arr.min():
+            return np.zeros_like(arr)
+        n = (arr - arr.min()) / (arr.max() - arr.min())
+        return 1 - n if invert else n
+
+    if 'total_reorgs' in df.columns:
+        scores += 0.3 * normalize(df['total_reorgs'].values)
+    if 'reorg_mass' in df.columns:
+        scores += 0.3 * normalize(df['reorg_mass'].values)
+    if 'cascade_time_s' in df.columns:
+        fill = df['duration'].max() if 'duration' in df.columns else 13000
+        ct = df['cascade_time_s'].fillna(fill).values
+        scores += 0.2 * normalize(ct, invert=True)
+    if 'econ_lag_s' in df.columns:
+        scores += 0.2 * normalize(np.abs(df['econ_lag_s'].fillna(0).values))
+
+    return scores
+
+
+# =============================================================================
+# Outcome sensitivity gradient computation
+# =============================================================================
+
+def _gradient(rf: RandomForestClassifier, X: np.ndarray, param_idx: int) -> np.ndarray:
+    """
+    Vectorized centered finite-difference gradient of P(v27_win) with respect
+    to one parameter column, evaluated at every row of X simultaneously.
+    Both nudged arrays are scored in a single batch predict_proba call each.
+    """
+    X_lo = X.copy()
+    X_hi = X.copy()
+    X_lo[:, param_idx] = np.clip(X[:, param_idx] - GRADIENT_DELTA, 0.0, 1.0)
+    X_hi[:, param_idx] = np.clip(X[:, param_idx] + GRADIENT_DELTA, 0.0, 1.0)
+    p_lo = rf.predict_proba(X_lo)[:, 1]
+    p_hi = rf.predict_proba(X_hi)[:, 1]
+    step = X_hi[:, param_idx] - X_lo[:, param_idx]
+    return np.abs(p_hi - p_lo) / np.where(step > 0, step, 1.0)
+
+
+def compute_d_pools(df: pd.DataFrame, rf: RandomForestClassifier) -> np.ndarray:
+    """
+    d_pools — RF probability gradient with respect to pool_committed_split.
+
+    Vectorized centered finite difference: two batch predict_proba calls cover
+    the entire dataset. High gradient = small change in committed hashrate
+    structure flips the predicted outcome. Peaks near the committed_split
+    decision boundary (~0.296 transition zone, ~0.214 Foundry flip-point).
+
+    Result is min-max normalized to [0, 1] across the dataset.
+    """
+    X = df[ACTIVE_PARAMS].values
+    committed_idx = ACTIVE_PARAMS.index('pool_committed_split')
+    sp = _gradient(rf, X, committed_idx)
+    lo, hi = sp.min(), sp.max()
+    return (sp - lo) / (hi - lo) if hi > lo else np.zeros_like(sp)
+
+
+def compute_d_economic(df: pd.DataFrame, rf: RandomForestClassifier) -> np.ndarray:
+    """
+    d_economic — RF probability gradient with respect to economic_split,
+    gated by position in the inversion zone.
+
+    Economic actors are only genuinely pivotal when economic_split is in the
+    inversion zone [CASCADE_FLOOR, ECON_OVERRIDE]. Outside this range the outcome
+    is structurally determined and exchange/custodian decisions cannot flip it.
+
+    The raw gradient is computed the same way as d_pools, then multiplied by
+    a gate function that is 1.0 at the ESP (~0.74) and decays toward 0 at the
+    zone boundaries. This reflects the structural ceiling: high gradient outside
+    the inversion zone doesn't represent real governance leverage.
+
+    Result is min-max normalized to [0, 1] across the dataset.
+    """
+    X = df[ACTIVE_PARAMS].values
+    econ_idx = ACTIVE_PARAMS.index('economic_split')
+
+    # Raw gradient — vectorized
+    grad = _gradient(rf, X, econ_idx)
+
+    # Inversion zone gate: triangular, peaks at ESP, 0 at zone boundaries
+    # Vectorized: rising ramp below ESP, falling ramp above, clipped to [0,1]
+    e = df['economic_split'].values
+    rising  = (e - ECON_CASCADE_FLOOR) / (ECON_ESP - ECON_CASCADE_FLOOR)
+    falling = (ECON_OVERRIDE - e)      / (ECON_OVERRIDE - ECON_ESP)
+    gate = np.where(e <= ECON_ESP, rising, falling)
+    gate = np.clip(gate, 0.0, 1.0)   # zero outside [CASCADE_FLOOR, OVERRIDE]
+
+    sp = grad * gate
+
+    # Min-max normalize
+    lo, hi = sp.min(), sp.max()
+    return (sp - lo) / (hi - lo) if hi > lo else np.zeros_like(sp)
+
+
+def compute_z_joint(d_pools: np.ndarray,
+                    d_economic: np.ndarray,
+                    contentiousness: np.ndarray,
+                    w_pools: float = 1.0,
+                    w_econ: float = 1.0,
+                    w_cont: float = 0.5) -> np.ndarray:
+    """
+    Joint governance leverage score.
+
+    Z_joint = w_pools * d_pools + w_econ * d_economic + w_cont * contentiousness
+
+    Contentiousness enters with lower weight — it's a precondition (outcome must
+    be in play) but the primary interest is where actor leverage is highest.
+    All inputs are already normalized to [0, 1].
+    """
+    def minmax(arr):
+        lo, hi = arr.min(), arr.max()
+        return (arr - lo) / (hi - lo) if hi > lo else np.zeros_like(arr)
+
+    return w_pools * d_pools + w_econ * d_economic + w_cont * minmax(contentiousness)
+
+
+# =============================================================================
+# Surprise score — high sensitivity but clean outcome
+# =============================================================================
+
+def compute_surprise(df: pd.DataFrame,
+                     z_joint: np.ndarray,
+                     rf: RandomForestClassifier) -> np.ndarray:
+    """
+    Surprise score: scenarios where governance leverage was high but the outcome
+    resolved cleanly (low contentiousness, decisive outcome).
+
+    surprise = Z_joint * (1 - outcome_certainty)
+
+    outcome_certainty = |P(v27_win) - 0.5| * 2   (0 = 50/50, 1 = certain)
+
+    High surprise = actor leverage was available but the dynamics resolved
+    decisively anyway — the "least expected" scenarios.
+    """
+    X = df[ACTIVE_PARAMS].values
+    probs = rf.predict_proba(X)[:, 1]
+    certainty = np.abs(probs - 0.5) * 2
+    return z_joint * (1 - certainty)
+
+
+# =============================================================================
+# Figures
+# =============================================================================
+
+PARAM_LABELS = {
+    'economic_split':         'Economic split (E)',
+    'pool_committed_split':   'Pool committed split (C)',
+    'pool_ideology_strength': 'Pool ideology strength (I)',
+    'pool_max_loss_pct':      'Pool max loss pct (M)',
+}
+
+
+def fig_sp_surface(df: pd.DataFrame, rf: RandomForestClassifier,
+                   output_dir: Path):
+    """
+    Main sensitivity surface figure: 3-panel layout.
+      Left:   E×C with Z_joint color overlay
+      Top-R:  d_pools distribution by outcome
+      Bot-R:  d_economic distribution by outcome
+    """
+    fig = plt.figure(figsize=(14, 8))
+    gs = gridspec.GridSpec(2, 2, width_ratios=[1.6, 1],
+                           hspace=0.35, wspace=0.30,
+                           left=0.07, right=0.97, top=0.91, bottom=0.09)
+
+    ax_main = fig.add_subplot(gs[:, 0])
+    ax_top  = fig.add_subplot(gs[0, 1])
+    ax_bot  = fig.add_subplot(gs[1, 1])
+
+    # --- Main panel: E×C scatter colored by Z_joint ---
+    d_pools     = df['d_pools'].values
+    d_econ      = df['d_economic'].values
+    z_joint     = df['z_joint'].values
+
+    sc = ax_main.scatter(
+        df['economic_split'], df['pool_committed_split'],
+        c=z_joint, cmap='plasma', s=35, alpha=0.8,
+        vmin=0, vmax=z_joint.max(), zorder=4,
+    )
+    cbar = fig.colorbar(sc, ax=ax_main, fraction=0.046, pad=0.04)
+    cbar.set_label('Z_joint (governance leverage)', fontsize=9)
+    cbar.ax.tick_params(labelsize=8)
+
+    # Mark top-20 joint Z_joint scenarios
+    top_idx = np.argsort(z_joint)[-20:]
+    ax_main.scatter(
+        df['economic_split'].values[top_idx],
+        df['pool_committed_split'].values[top_idx],
+        s=90, marker='*', color='gold', edgecolors='black',
+        linewidths=0.6, zorder=6, label='Top-20 joint Z_joint',
+    )
+
+    # Threshold lines
+    ax_main.axvline(ECON_CASCADE_FLOOR, color='#333333', lw=1.3, ls=':', alpha=0.8, zorder=5)
+    ax_main.axvline(ECON_ESP,           color='#333333', lw=1.3, ls='--', alpha=0.8, zorder=5)
+    ax_main.axvline(ECON_OVERRIDE,      color='#333333', lw=1.3, ls=':', alpha=0.8, zorder=5)
+    ax_main.axhline(FOUNDRY_FLIP,       color='#555555', lw=1.0, ls=':', alpha=0.7, zorder=5)
+    ax_main.axhline(COMMITTED_THRESHOLD,color='#555555', lw=1.0, ls='--', alpha=0.7, zorder=5)
+
+    # PRIM uncertainty box
+    pbox_x = PRIM_BOX['economic_split']
+    pbox_y = PRIM_BOX['pool_committed_split']
+    ax_main.add_patch(mpatches.FancyBboxPatch(
+        (pbox_x[0], pbox_y[0]), pbox_x[1]-pbox_x[0], pbox_y[1]-pbox_y[0],
+        boxstyle='square,pad=0', fill=False,
+        edgecolor='dodgerblue', linewidth=1.8, linestyle='--', zorder=5,
+    ))
+
+    # Threshold labels
+    y_top = df['pool_committed_split'].max()
+    tkw = dict(fontsize=7.5, color='#111111',
+               bbox=dict(boxstyle='round,pad=0.15', facecolor='white',
+                         edgecolor='#aaaaaa', alpha=0.85))
+    ax_main.text(ECON_CASCADE_FLOOR+0.01, y_top-0.02, f'Cascade\nfloor', va='top', ha='left', **tkw)
+    ax_main.text(ECON_ESP,                y_top-0.02, f'ESP\n~0.74',     va='top', ha='center', **tkw)
+    ax_main.text(ECON_OVERRIDE-0.01,      y_top-0.02, f'Override',       va='top', ha='right', **tkw)
+
+    ax_main.set_xlabel(PARAM_LABELS['economic_split'], fontsize=9)
+    ax_main.set_ylabel(PARAM_LABELS['pool_committed_split'], fontsize=9)
+    ax_main.set_title('Joint Governance Leverage (Z_joint) — E×C projection',
+                      fontsize=10, fontweight='bold')
+    ax_main.legend(fontsize=8, loc='lower right')
+    ax_main.tick_params(labelsize=8)
+
+    # --- Right panels: gradient distributions by outcome ---
+    outcomes  = ['v27_dominant', 'v26_dominant', 'contested']
+    colors    = {'v27_dominant': '#2ca02c', 'v26_dominant': '#d62728', 'contested': '#e6a800'}
+    labels_ok = {'v27_dominant': 'v27 win', 'v26_dominant': 'v26 win', 'contested': 'Contested'}
+
+    for ax, col, title in [
+        (ax_top, 'd_pools',    'd_pools by outcome'),
+        (ax_bot, 'd_economic', 'd_economic by outcome'),
+    ]:
+        data  = [df.loc[df['outcome'] == o, col].values for o in outcomes]
+        bplot = ax.boxplot(data, patch_artist=True, notch=False,
+                           medianprops=dict(color='black', lw=1.5))
+        for patch, outcome in zip(bplot['boxes'], outcomes):
+            patch.set_facecolor(colors[outcome])
+            patch.set_alpha(0.7)
+        ax.set_xticks([1, 2, 3])
+        ax.set_xticklabels([labels_ok[o] for o in outcomes], fontsize=8)
+        ax.set_ylabel(col, fontsize=8)
+        ax.set_title(title, fontsize=9, fontweight='bold')
+        ax.tick_params(labelsize=7)
+        ax.set_ylim(-0.05, 1.05)
+
+    fig.suptitle('Outcome Sensitivity — Pool Coalitions and Economic Actors (2016-block)',
+                 fontsize=12, fontweight='bold')
+
+    out = output_dir / 'fig_sp_surface.png'
+    plt.savefig(out, dpi=DPI, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved: {out}")
+
+
+def fig_sp_top_scenarios(df: pd.DataFrame, output_dir: Path, n_top: int = 15):
+    """
+    Parallel coordinates plot of the top-N scenarios by Z_joint.
+    Shows which parameter combinations generate the highest governance leverage
+    and how they relate to outcome and surprise score.
+    """
+    top = df.nlargest(n_top, 'z_joint').reset_index(drop=True)
+
+    fig, axes = plt.subplots(1, 4, figsize=(13, 5), sharey=False)
+    params = ACTIVE_PARAMS
+    colors = {'v27_dominant': '#2ca02c', 'v26_dominant': '#d62728', 'contested': '#e6a800'}
+
+    for i, row in top.iterrows():
+        c = colors.get(row['outcome'], 'grey')
+        vals = [row[p] for p in params]
+        for j in range(len(params) - 1):
+            axes[j].plot([0, 1], [vals[j], vals[j+1]], color=c, alpha=0.6, lw=1.5)
+        # Last axis
+        axes[-1].plot([0], [vals[-1]], 'o', color=c, alpha=0.6)
+
+    for j, (ax, p) in enumerate(zip(axes, params)):
+        ax.set_xlim(0, 1)
+        ax.set_ylim(df[p].min() - 0.02, df[p].max() + 0.02)
+        ax.set_xticks([])
+        ax.set_ylabel(PARAM_LABELS[p], fontsize=8)
+        ax.tick_params(labelsize=7)
+        ax.axhline(df[p].median(), color='#aaaaaa', lw=0.8, ls='--', alpha=0.6)
+
+    # Legend
+    legend_els = [
+        Line2D([0],[0], color='#2ca02c', lw=2, label='v27 win'),
+        Line2D([0],[0], color='#d62728', lw=2, label='v26 win'),
+        Line2D([0],[0], color='#e6a800', lw=2, label='Contested'),
+    ]
+    fig.legend(handles=legend_els, loc='lower center', ncol=3,
+               fontsize=8, bbox_to_anchor=(0.5, 0.01))
+
+    fig.suptitle(f'Top-{n_top} Scenarios by Joint Governance Leverage (Z_joint)',
+                 fontsize=11, fontweight='bold')
+    plt.tight_layout(rect=[0, 0.07, 1, 0.95])
+
+    out = output_dir / 'fig_sp_top_scenarios.png'
+    plt.savefig(out, dpi=DPI, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved: {out}")
+
+
+# =============================================================================
+# Report
+# =============================================================================
+
+def write_report(df: pd.DataFrame, rf: RandomForestClassifier, output_dir: Path):
+    top_joint   = df.nlargest(10, 'z_joint')
+    top_surprise = df.nlargest(10, 'surprise')
+
+    lines = [
+        "# Outcome Sensitivity Report — d_pools and d_economic",
+        "",
+        f"**Dataset:** n={len(df)} scenarios, {df['sweep_name'].nunique()} sweeps, 2016-block retarget",
+        f"**RF OOB accuracy:** {rf.oob_score_*100:.1f}%",
+        "",
+        "## Score Distributions",
+        "",
+        "| Score | Mean | Median | Max | Std |",
+        "|-------|:----:|:------:|:---:|:---:|",
+    ]
+    for col in ['d_pools', 'd_economic', 'z_joint', 'surprise']:
+        s = df[col]
+        lines.append(f"| {col} | {s.mean():.3f} | {s.median():.3f} | {s.max():.3f} | {s.std():.3f} |")
+
+    lines += [
+        "",
+        "## Mean Gradient by Outcome",
+        "",
+        "| Outcome | n | Mean d_pools | Mean d_economic | Mean Z_joint |",
+        "|---------|:-:|:------------:|:---------------:|:------------:|",
+    ]
+    for outcome in ['v27_dominant', 'v26_dominant', 'contested']:
+        sub = df[df['outcome'] == outcome]
+        if len(sub):
+            lines.append(
+                f"| {outcome} | {len(sub)} "
+                f"| {sub['d_pools'].mean():.3f} "
+                f"| {sub['d_economic'].mean():.3f} "
+                f"| {sub['z_joint'].mean():.3f} |"
+            )
+
+    lines += [
+        "",
+        "## Top-10 Scenarios by Joint Governance Leverage (Z_joint)",
+        "",
+        "| Rank | Sweep | Scenario | E | C | I | M | Outcome | d_pools | d_econ | Z_joint |",
+        "|:----:|-------|----------|:-:|:-:|:-:|:-:|---------|:-------:|:------:|:-------:|",
+    ]
+    for rank, (_, row) in enumerate(top_joint.iterrows(), 1):
+        lines.append(
+            f"| {rank} | {row['sweep_name']} | {row.get('scenario_id','')} "
+            f"| {row['economic_split']:.3f} | {row['pool_committed_split']:.3f} "
+            f"| {row['pool_ideology_strength']:.3f} | {row['pool_max_loss_pct']:.3f} "
+            f"| {row['outcome']} "
+            f"| {row['d_pools']:.3f} | {row['d_economic']:.3f} | {row['z_joint']:.3f} |"
+        )
+
+    lines += [
+        "",
+        "## Top-10 Surprise Scenarios (high leverage, clean resolution)",
+        "",
+        "These scenarios had high governance leverage available but resolved",
+        "decisively anyway — the 'least expected' outcomes.",
+        "",
+        "| Rank | Sweep | Scenario | E | C | Outcome | Z_joint | Surprise |",
+        "|:----:|-------|----------|:-:|:-:|---------|:-------:|:--------:|",
+    ]
+    for rank, (_, row) in enumerate(top_surprise.iterrows(), 1):
+        lines.append(
+            f"| {rank} | {row['sweep_name']} | {row.get('scenario_id','')} "
+            f"| {row['economic_split']:.3f} | {row['pool_committed_split']:.3f} "
+            f"| {row['outcome']} "
+            f"| {row['z_joint']:.3f} | {row['surprise']:.3f} |"
+        )
+
+    lines += [
+        "",
+        "## Structural Notes",
+        "",
+        "**d_pools** peaks near pool_committed_split ≈ 0.296 (Phase 3 transition threshold)",
+        "and ≈ 0.214 (Foundry flip-point). It is computed as the RF probability gradient",
+        "|dP(v27_win)/d(pool_committed_split)| — how rapidly the predicted outcome changes",
+        "with a small shift in committed pool hashrate.",
+        "",
+        "**d_economic** is gated to zero outside the inversion zone [0.50, 0.82].",
+        "Outside this range the outcome is structurally determined regardless of exchange",
+        "or custodian custody decisions. Within the zone it peaks near the ESP (≈0.74),",
+        "where a small shift in economic custody crosses the self-sustaining threshold.",
+        "",
+        "**Surprise** = Z_joint × (1 - outcome_certainty). High surprise identifies",
+        "scenarios where governance leverage was structurally available but dynamics",
+        "resolved cleanly — counterintuitive outcomes from the actor leverage perspective.",
+    ]
+
+    out = output_dir / 'sp_report.md'
+    out.write_text('\n'.join(lines))
+    print(f"  Saved: {out}")
+
+
+# =============================================================================
+# Entry point
+# =============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--db', type=Path, default=DB_PATH,
+                        help=f'sweep_results.db path (default: {DB_PATH})')
+    parser.add_argument('--output-dir', type=Path, default=OUTPUT_DIR,
+                        help=f'Output directory (default: {OUTPUT_DIR})')
+    parser.add_argument('--w-pools', type=float, default=1.0,
+                        help='Weight for d_pools in Z_joint (default: 1.0)')
+    parser.add_argument('--w-econ', type=float, default=1.0,
+                        help='Weight for d_economic in Z_joint (default: 1.0)')
+    parser.add_argument('--w-cont', type=float, default=0.5,
+                        help='Weight for contentiousness in Z_joint (default: 0.5)')
+    args = parser.parse_args()
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    print("\n=== Loading data ===")
+    df = load_data(args.db)
+
+    print("\n=== Training RF ===")
+    rf = train_rf(df)
+
+    print("\n=== Computing contentiousness ===")
+    df['contentiousness'] = compute_contentiousness(df)
+
+    print("\n=== Computing d_pools (RF gradient over pool_committed_split) ===")
+    df['d_pools'] = compute_d_pools(df, rf)
+    print(f"  d_pools: mean={df['d_pools'].mean():.3f}  max={df['d_pools'].max():.3f}")
+
+    print("\n=== Computing d_economic (RF gradient over economic_split, gated) ===")
+    df['d_economic'] = compute_d_economic(df, rf)
+    print(f"  d_economic: mean={df['d_economic'].mean():.3f}  max={df['d_economic'].max():.3f}")
+
+    print("\n=== Computing Z_joint and surprise ===")
+    df['z_joint'] = compute_z_joint(
+        df['d_pools'].values, df['d_economic'].values,
+        df['contentiousness'].values,
+        w_pools=args.w_pools, w_econ=args.w_econ, w_cont=args.w_cont,
+    )
+    df['surprise'] = compute_surprise(df, df['z_joint'].values, rf)
+
+    print("\n=== Gradient by outcome ===")
+    for outcome in ['v27_dominant', 'v26_dominant', 'contested']:
+        sub = df[df['outcome'] == outcome]
+        if len(sub):
+            print(f"  {outcome:20s} n={len(sub):4d}  "
+                  f"d_pools={sub['d_pools'].mean():.3f}  "
+                  f"d_econ={sub['d_economic'].mean():.3f}  "
+                  f"Z_joint={sub['z_joint'].mean():.3f}")
+
+    # Save scores CSV
+    out_csv = args.output_dir / 'sp_scores.csv'
+    df.to_csv(out_csv, index=False)
+    print(f"\n  Saved: {out_csv}")
+
+    # Save top scenarios JSON
+    top20 = df.nlargest(20, 'z_joint')[
+        ['sweep_name', 'scenario_id', 'economic_split', 'pool_committed_split',
+         'pool_ideology_strength', 'pool_max_loss_pct', 'outcome',
+         'd_pools', 'd_economic', 'z_joint', 'surprise']
+    ].to_dict(orient='records')
+    out_json = args.output_dir / 'sp_top_scenarios.json'
+    out_json.write_text(json.dumps(top20, indent=2))
+    print(f"  Saved: {out_json}")
+
+    print("\n=== Generating figures ===")
+    fig_sp_surface(df, rf, args.output_dir)
+    fig_sp_top_scenarios(df, args.output_dir)
+
+    print("\n=== Writing report ===")
+    write_report(df, rf, args.output_dir)
+
+    print("\nDone. Outputs in:", args.output_dir)
+
+
+if __name__ == '__main__':
+    main()
