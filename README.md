@@ -197,4 +197,5 @@ MIT — see [LICENSE](LICENSE)
 ## Acknowledgments
 
 Simulations built on [Warnet](https://github.com/bitcoin-dev-tools/warnet) by the Bitcoin Dev Tools team.
+
 Bitcoin Consensus Analysis (BCAP) [BCAP](https://github.com/bitcoin-cap/bcap)
