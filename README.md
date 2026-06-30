@@ -94,37 +94,34 @@ pip install numpy scipy scikit-learn pandas pyyaml matplotlib
 
 ## Exploring the Results
 
-The fastest way to engage with the findings is through the SQLite results database. No Kubernetes or warnet installation required.
+[#exploring-the-results](#exploring-the-results)
+
+All 2,694 scenarios are in the SQLite results database. No Kubernetes or warnet
+installation required. The schema and full column list are in
+[sweeps/DATABASE.md](sweeps/DATABASE.md).
 
 ```bash
 cd sweeps
 
-# Outcome distribution across all 2,694 scenarios
-sqlite3 sweep_results.db \
-  "SELECT outcome, COUNT(*) as n, ROUND(AVG(economic_split),3) as mean_econ
-   FROM scenarios GROUP BY outcome ORDER BY n DESC"
+# What's in the database — table and column overview
+sqlite3 sweep_results.db ".schema scenarios"
 
-# The two-scale structure: economic_split dominates globally
+# Total scenario count and the outcome categories used
 sqlite3 sweep_results.db \
-  "SELECT CASE WHEN economic_split < 0.50 THEN 'E < 0.50'
-               WHEN economic_split < 0.74 THEN 'E 0.50-0.74'
-               WHEN economic_split < 0.82 THEN 'E 0.74-0.82'
-               ELSE 'E > 0.82' END as zone,
-          outcome, COUNT(*) as n
-   FROM scenarios GROUP BY zone, outcome ORDER BY zone, n DESC"
+  "SELECT outcome, COUNT(*) AS n FROM scenarios GROUP BY outcome"
 
-# Pool committed split threshold in the contested zone
+# Range of each input parameter sampled across the sweep program
 sqlite3 sweep_results.db \
-  "SELECT outcome,
-          ROUND(AVG(pool_committed_split),3) as mean_C,
-          ROUND(MIN(pool_committed_split),3) as min_C,
-          ROUND(MAX(pool_committed_split),3) as max_C
-   FROM scenarios
-   WHERE economic_split BETWEEN 0.55 AND 0.78
-   GROUP BY outcome"
+  "SELECT ROUND(MIN(economic_split),3) AS min_E,
+          ROUND(MAX(economic_split),3) AS max_E,
+          ROUND(MIN(pool_committed_split),3) AS min_C,
+          ROUND(MAX(pool_committed_split),3) AS max_C
+   FROM scenarios"
 ```
 
-For a full schema and query guide, see [sweeps/DATABASE.md](sweeps/DATABASE.md).
+The database supports the full analysis pipeline. See
+[sweeps/DATABASE.md](sweeps/DATABASE.md) for the schema and
+[analysis/](analysis/) for the boundary-fitting and figure-generation scripts.
 
 ---
 
