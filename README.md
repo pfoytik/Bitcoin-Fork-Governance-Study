@@ -28,8 +28,6 @@ The answer is a two-scale decision boundary:
 - **Pool identity matters, not just aggregate hashrate** — a single large pool (Foundry, 27%) commits provides stronger cascade signal than equivalent smaller pools; this effect is magnified on lite network simulations
 - **Full-network finding**: on the 60-node network with proper economic resolution, `economic_split` dominates at 60% feature importance; pool composition is secondary
 
-See [FINDINGS.md](FINDINGS.md) for all 21 numbered findings, or [sweeps/SWEEP_FINDINGS.md](sweeps/SWEEP_FINDINGS.md) for the full technical record.
-
 ---
 
 ## Repository Structure
@@ -38,7 +36,6 @@ See [FINDINGS.md](FINDINGS.md) for all 21 numbered findings, or [sweeps/SWEEP_FI
 bitcoin-fork-governance-study/
 │
 ├── README.md                   ← You are here
-├── FINDINGS.md                 ← Curated summary of all 21 findings
 ├── METHODOLOGY.md              ← How the simulation works
 │
 ├── scenarios/                  ← Warnet scenario script
@@ -52,7 +49,6 @@ bitcoin-fork-governance-study/
 │
 ├── sweeps/                     ← Parameter sweep infrastructure and results
 │   ├── sweep_results.db        ← SQLite database: all 2,694 scenarios
-│   ├── SWEEP_FINDINGS.md       ← Complete technical findings (4,200 lines)
 │   ├── specs/                  ← YAML specs for all sweep configurations
 │   ├── tools/                  ← Sweep pipeline scripts (1–5)
 │   └── DATABASE.md             ← Database schema and query guide
