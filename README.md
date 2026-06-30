@@ -182,7 +182,7 @@ python plot_decision_boundary.py --input output/
 @inproceedings{foytik2026bitcoin,
   title     = {Quantifying Bitcoin Network Resilience Through Critical Scenario Discovery},
   author    = {Foytik, Peter},
-  booktitle = {Proceedings of the University of Wyoming Bitcoin Research Initiative Workshop},
+  booktitle = {Proceedings of the University of Wyoming Bitcoin Research Institute Workshop},
   year      = {2026},
   note      = {Data and code: https://github.com/pfoytik/bitcoin-fork-governance-study}
 }
