@@ -20,14 +20,26 @@ The answer is a two-scale decision boundary:
 
 ---
 
-## Key Findings at a Glance
+## What the Study Examines
 
-- **Economic Self-Sustaining Point (ESP) at E ≈ 0.74** — below this, v27 cannot win regardless of mining support; above E ≈ 0.82, v27 wins regardless of mining
-- **Pool committed hashrate threshold at C ≈ 0.25–0.30** — within the contested zone, v27 wins when more than ~25–30% of hashrate is ideologically committed to v27
-- **2016-block retarget cascade** — the decisive mechanism: the first chain to accumulate 2016 blocks fires a difficulty adjustment that makes its blocks 2–3× more profitable, cascading all remaining pools
-- **Pool identity matters, not just aggregate hashrate** — a single large pool (Foundry, 27%) commits provides stronger cascade signal than equivalent smaller pools; this effect is magnified on lite network simulations
-- **Full-network finding**: on the 60-node network with proper economic resolution, `economic_split` dominates at 60% feature importance; pool composition is secondary
+[#what-the-study-examines](#what-the-study-examines)
 
+The simulation maps fork outcomes across a 6-parameter space. The analysis
+addresses four questions, each answered quantitatively in the paper:
+
+- **Where is the economic threshold?** At what level of economic adoption does
+  the outcome stop depending on mining behavior — in either direction?
+- **What role does committed hashrate play?** Within the contested region, how
+  much ideologically-committed mining hashrate is needed to shift the outcome?
+- **What is the cascade mechanism?** How does the 2016-block difficulty retarget
+  function in resolving (or failing to resolve) a contested fork?
+- **Does pool identity matter, or only aggregate hashrate?** Is committed
+  hashrate a simple scalar, or does *which* pools commit change the outcome?
+
+The headline result is a two-scale decision boundary: a global scale governed by
+economic adoption, and a local scale within the contested zone governed by mining
+dynamics. Full thresholds, mechanisms, and feature-importance results are
+presented in the paper and at the UW BRI workshop (July 2026).
 ---
 
 ## Repository Structure
