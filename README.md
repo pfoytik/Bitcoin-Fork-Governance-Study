@@ -10,7 +10,7 @@
 
 ## What This Is
 
-This study models a contested Bitcoin soft fork — a new consensus rule set (v27) competing against the existing rule set (v26) — and maps the conditions under which each side wins, loses, or produces a sustained chain split. Simulations run real `bitcoind` nodes on Kubernetes using [Warnet](https://github.com/bitcoin-dev-tools/warnet), with agents representing mining pools, exchanges, institutions, and users making independent, economically-motivated decisions.
+This study models a contested Bitcoin soft fork — a ficticious new consensus rule set that is limiting the previous rules (labeled v27) competing against the existing rule set (labeled v26) — and maps the conditions under which each side wins, loses, or produces a sustained chain split. Simulations run real `bitcoind` nodes on Kubernetes using [Warnet](https://github.com/bitcoin-dev-tools/warnet), with agents representing mining pools, exchanges, institutions, and users making independent, economically-motivated decisions.
 
 The central question: **under what combinations of miner commitment, economic adoption, and pool ideology does v27 succeed or fail?**
 
