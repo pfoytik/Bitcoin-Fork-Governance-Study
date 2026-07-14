@@ -1,10 +1,12 @@
 # Bitcoin Soft Fork Governance — Simulation Study
 
 **Paper:** Quantifying Bitcoin Network Resilience Through Critical Scenario Discovery  
+**Presentation:** Bitcoin_NetworkResilience_Forks_v4.pdf  
 **Workshop:** University of Wyoming Bitcoin Research Initiative, July 2026  
 **Author:** Peter Foytik, Old Dominion University
 
 > This repository contains the simulation scenario, network configurations, parameter sweep tooling, and full results database accompanying the paper. All 21 quantitative findings in the paper are reproducible from the data and tools here.
+
 
 ---
 
