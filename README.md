@@ -179,6 +179,8 @@ python plot_decision_boundary.py --input output/
 ---
 
 ## Citation
+Arxiv Paper:
+https://arxiv.org/abs/2608.05461
 
 ```bibtex
 @inproceedings{foytik2026bitcoin,
